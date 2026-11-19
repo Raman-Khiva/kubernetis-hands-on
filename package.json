@@ -1,0 +1,16 @@
+{
+  "name": "quote-api",
+  "version": "1.0.0",
+  "description": "Hands-on Quote API — feel the pain before Kubernetes",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "express": "^5.1.0"
+  }
+}
