@@ -1,52 +1,119 @@
 const express = require("express");
+const { createClient } = require("redis");
 
 const PORT = Number(process.env.PORT) || 3000;
-const app = express();
+const INSTANCE = process.env.INSTANCE_NAME || require("os").hostname();
+const REDIS_URL = process.env.REDIS_URL || "";
 
-app.use(express.json());
-
-// In-memory store on purpose — when the process dies, quotes die with it.
-const quotes = [
+const SEED_QUOTES = [
   { id: 1, text: "Simplicity is the ultimate sophistication.", author: "Leonardo da Vinci" },
   { id: 2, text: "Make it work, make it right, make it fast.", author: "Kent Beck" },
 ];
-let nextId = 3;
 
-app.get("/health", (_req, res) => {
-  res.json({ status: "ok", uptimeSeconds: Math.floor(process.uptime()) });
+const app = express();
+app.use(express.json());
+
+app.use((_req, res, next) => {
+  res.setHeader("X-Instance", INSTANCE);
+  next();
 });
 
-app.get("/quotes", (_req, res) => {
-  res.json({ count: quotes.length, quotes });
+/** @type {{ mode: "memory" | "redis", memoryQuotes?: any[], nextId?: number, redis?: import("redis").RedisClientType }} */
+const store = { mode: "memory", memoryQuotes: [...SEED_QUOTES], nextId: 3 };
+
+async function listQuotes() {
+  if (store.mode === "redis") {
+    const raw = await store.redis.get("quotes");
+    return raw ? JSON.parse(raw) : [];
+  }
+  return store.memoryQuotes;
+}
+
+async function addQuote(text, author) {
+  if (store.mode === "redis") {
+    const quotes = await listQuotes();
+    const nextId = Number((await store.redis.get("quotes:nextId")) || "1");
+    const quote = { id: nextId, text, author };
+    quotes.push(quote);
+    await store.redis.set("quotes", JSON.stringify(quotes));
+    await store.redis.set("quotes:nextId", String(nextId + 1));
+    return quote;
+  }
+
+  const quote = {
+    id: store.nextId++,
+    text,
+    author,
+  };
+  store.memoryQuotes.push(quote);
+  return quote;
+}
+
+async function initStore() {
+  if (!REDIS_URL) {
+    console.log("store=memory (set REDIS_URL to share data across replicas)");
+    return;
+  }
+
+  const redis = createClient({ url: REDIS_URL });
+  redis.on("error", (err) => console.error("redis error", err));
+  await redis.connect();
+
+  const existing = await redis.get("quotes");
+  if (!existing) {
+    await redis.set("quotes", JSON.stringify(SEED_QUOTES));
+    await redis.set("quotes:nextId", "3");
+  }
+
+  store.mode = "redis";
+  store.redis = redis;
+  console.log(`store=redis (${REDIS_URL})`);
+}
+
+app.get("/health", async (_req, res) => {
+  res.json({
+    status: "ok",
+    instance: INSTANCE,
+    store: store.mode,
+    uptimeSeconds: Math.floor(process.uptime()),
+  });
 });
 
-app.post("/quotes", (req, res) => {
+app.get("/quotes", async (_req, res) => {
+  const quotes = await listQuotes();
+  res.json({ instance: INSTANCE, store: store.mode, count: quotes.length, quotes });
+});
+
+app.post("/quotes", async (req, res) => {
   const { text, author } = req.body || {};
 
   if (!text || typeof text !== "string") {
     return res.status(400).json({ error: "body.text is required (string)" });
   }
 
-  const quote = {
-    id: nextId++,
-    text: text.trim(),
-    author: author ? String(author).trim() : "Anonymous",
-  };
-
-  quotes.push(quote);
-  res.status(201).json(quote);
+  const quote = await addQuote(
+    text.trim(),
+    author ? String(author).trim() : "Anonymous"
+  );
+  res.status(201).json({ instance: INSTANCE, store: store.mode, quote });
 });
 
-// Deliberate crash switch — use this in the Stage 1 tasks.
 app.post("/crash", (_req, res) => {
-  res.status(500).json({ error: "crashing on purpose..." });
+  res.status(500).json({ instance: INSTANCE, error: "crashing on purpose..." });
   setTimeout(() => {
-    console.error("💥 intentional crash");
+    console.error(`💥 intentional crash on ${INSTANCE}`);
     process.exit(1);
   }, 100);
 });
 
-app.listen(PORT, () => {
-  console.log(`Quote API listening on http://localhost:${PORT}`);
-  console.log(`pid=${process.pid}`);
-});
+initStore()
+  .then(() => {
+    app.listen(PORT, () => {
+      console.log(`Quote API (${INSTANCE}) listening on http://localhost:${PORT}`);
+      console.log(`pid=${process.pid}`);
+    });
+  })
+  .catch((err) => {
+    console.error("failed to start", err);
+    process.exit(1);
+  });
